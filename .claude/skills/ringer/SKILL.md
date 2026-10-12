@@ -95,6 +95,10 @@ diffs, and reports at explicit paths. Workers return compact status plus those
 paths, not pasted history. The on-camera brief and no-pointer-spec invariant
 still apply: a path may supply material, never replace the instructions.
 
+## Dependent stages: gate them
+
+Ringer starts every task in a manifest at once, so one task's PASS never holds back another. When step B consumes step A's output, put A and B in separate manifests and run them through `scripts/ringer_gate.py PIPELINE.json`. The gate launches a stage only after every stage it `needs` has an all-PASS receipt whose artifacts still hash to the recorded digest and whose check files are unchanged; it hands the consumer a read-only snapshot (`{inputs}`), keeps checks in a separate `{checks}` dir that workers cannot write, and records BLOCKED plus `not_started` for everything downstream of a FAIL, TIMEOUT, missing artifact, edited check or stale receipt. Demo and acceptance cases: `examples/stage-gate/run_demo.sh`.
+
 ## The one exception: `ask`
 
 Rule 2 holds for anything that changes a file, runs a build, or produces an

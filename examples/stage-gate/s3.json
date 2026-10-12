@@ -1,0 +1,19 @@
+{
+ "run_name": "gate-demo-s3",
+ "workdir": "{root}/work/s3",
+ "max_parallel": 1,
+ "tasks": [
+  {
+   "key": "report",
+   "engine": "opencode",
+   "task_type": "probe",
+   "timeout_s": 240,
+   "max_attempts": 1,
+   "spec": "Read {inputs}/s2/sum/sum.txt (do not modify it). Write report.md in the current directory with a heading '# Report' and a line 'Total: N' where N is the number in that file.",
+   "check": "sh {checks}/s3_report.sh {inputs}/s2/sum",
+   "expect_files": [
+    "report.md"
+   ]
+  }
+ ]
+}

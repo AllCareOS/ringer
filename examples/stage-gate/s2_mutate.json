@@ -1,0 +1,19 @@
+{
+ "run_name": "gate-demo-s2_mutate",
+ "workdir": "{root}/work/s2",
+ "max_parallel": 1,
+ "tasks": [
+  {
+   "key": "sum",
+   "engine": "opencode",
+   "task_type": "probe",
+   "timeout_s": 240,
+   "max_attempts": 1,
+   "spec": "Read the file {inputs}/s1/gen/numbers.txt (do not modify it). Write sum.txt in the current directory containing only the sum of those integers.",
+   "check": "sh {checks}/s2_sum.sh {inputs}/s1/gen",
+   "expect_files": [
+    "sum.txt"
+   ]
+  }
+ ]
+}

@@ -1,0 +1,5 @@
+#!/bin/bash
+# Never-finishing worker for the controller-timeout case: leaves a detached
+# grandchild in its own session, then sleeps. The gate must kill both.
+python3 -c "import subprocess; subprocess.Popen(['sleep', '7311'], start_new_session=True)"
+sleep 7312
