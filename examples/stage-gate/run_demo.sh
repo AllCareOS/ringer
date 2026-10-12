@@ -31,7 +31,12 @@ blocked=[e["reason"] for e in ev if e.get("event")=="BLOCKED"]
 reruns=[e["stage"] for e in ev if e.get("event")=="receipt_invalid_rerun"]
 passed=any(e.get("event")=="pipeline_pass" for e in ev)
 if expect=="pass": ok=passed and not blocked
-elif expect=="blocked": ok=bool(blocked) and "s2" not in launched and not passed
+elif expect=="blocked":
+    ok=bool(blocked) and "s2" not in launched and not passed
+    if case=="treekill":
+        import subprocess
+        ok = ok and "controller timeout" in blocked[-1] and "survivors after kill: []" in blocked[-1] \
+             and not subprocess.run(["pgrep","-f","sleep 731[12]"],capture_output=True).stdout
 elif expect=="rerun": ok="s1" in reruns and launched.count("s1")==2
 elif expect=="mutate":
     r=json.load(open(root/"receipts"/"s2.json"))
@@ -47,6 +52,9 @@ for s in failcheck timeout missing symlink codex; do P=$(pipeline $s s1_$s.json)
 P=$(pipeline failresume s1_failcheck.json); run "$P"; run "$P" --resume; summary failresume rerun
 P=$(pipeline editedcheck s1.json); run "$P" --stop-after s1; echo "# tampered" >> "$BASE/editedcheck-checks/s1_numbers.sh"; run "$P" --resume; summary editedcheck rerun
 P=$(pipeline stale s1.json); run "$P" --stop-after s1; echo 6 >> "$BASE/stale/work/s1/gen/numbers.txt"; run "$P" --resume; summary stale rerun
+P=$(pipeline treekill s1_sleeper.json); "$PY" -c "import json,sys;p=json.load(open(sys.argv[1]));p['stages'][0]['timeout_s']=25;json.dump(p,open(sys.argv[1],'w'))" "$P"
+PATH="$HERE/sleeper:$PATH" "$PY" "$GATE" "$P" >/dev/null 2>&1; sleep 2
+echo "survivors: $(pgrep -f 'sleep 731[12]' | tr '\n' ' ')"; summary treekill blocked
 P=$(pipeline mutate s1.json s2_mutate.json); run "$P" --stop-after s1
 M="$BASE/mutate"; IN="$M/inputs/s2/s1/gen"
 PATH="$HERE/hostile:$PATH" HOSTILE_INPUT="$IN/numbers.txt" \

@@ -46,6 +46,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -57,7 +58,11 @@ from pathlib import Path
 
 RINGER = Path(__file__).resolve().parent.parent / "ringer.py"
 EXCLUDE = {"worker.log"}
-SANDBOXED_BINS = {"opencode-sandboxed.sh"}  # engines whose OS sandbox confines writes to the task dir
+TRUSTED_WRAPPER = Path(__file__).resolve().parent.parent / "engines" / "opencode-sandboxed.sh"
+# Writable roots the Seatbelt wrapper grants besides the task dir and a fresh scratch dir.
+WRAPPER_WRITE_ROOTS = [Path("~/.local/share/opencode").expanduser(), Path("~/.local/state/opencode").expanduser(),
+                       Path("~/.config/opencode").expanduser()]
+ESCAPE_FLAGS = {"--no-sandbox"}
 
 
 class Blocked(Exception):
@@ -125,6 +130,57 @@ def render(obj, subs: dict[str, str]):
     return obj
 
 
+def descendants(pid: int) -> list[int]:
+    """All live descendants of pid (Ringer starts workers in their own sessions, so groups are not enough)."""
+    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True).stdout
+    children: dict[int, list[int]] = {}
+    for line in out.splitlines():
+        c, pp = (int(x) for x in line.split())
+        children.setdefault(pp, []).append(c)
+    found, stack = [], [pid]
+    while stack:
+        for c in children.get(stack.pop(), []):
+            found.append(c)
+            stack.append(c)
+    return found
+
+
+def kill_tree(pid: int) -> list[int]:
+    """Freeze then kill pid and every descendant; return any pid still alive afterwards."""
+    victims: list[int] = []
+    for _ in range(5):
+        tree = [pid, *descendants(pid)] if pid else []
+        new = [p for p in tree if p not in victims]
+        for p in new:
+            try:
+                os.kill(p, signal.SIGSTOP)
+            except ProcessLookupError:
+                pass
+        victims += new
+        if not new:
+            break
+    for p in victims:
+        try:
+            os.kill(p, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    time.sleep(0.5)
+    states = subprocess.run(["ps", "-A", "-o", "pid=,stat="], capture_output=True, text=True).stdout
+    live = {int(pid) for pid, st in (l.split()[:2] for l in states.splitlines()) if not st.startswith("Z")}
+    return [p for p in victims if p in live]  # zombies are dead, merely unreaped
+
+
+def run_controller_check(command: str, cwd: Path, timeout: int, out_path: Path) -> dict:
+    """Execute a task's check independently of Ringer and keep its complete raw output."""
+    try:
+        cp = subprocess.run(command, shell=True, cwd=cwd, capture_output=True, timeout=timeout)
+        rc, data = cp.returncode, cp.stdout + b"\n--- stderr ---\n" + cp.stderr
+    except subprocess.TimeoutExpired as e:
+        rc, data = "TIMEOUT", (e.stdout or b"") + b"\n--- stderr ---\n" + (e.stderr or b"")
+    out_path.write_bytes(data)
+    return {"command": command, "exit": rc, "output_path": str(out_path), "output_sha": sha(data)}
+
+
 def inside(child: Path, parent: Path) -> bool:
     try:
         child.resolve().relative_to(parent.resolve())
@@ -163,23 +219,72 @@ class Gate:
         return tree_digest(self.checks, exclude=set())[0]
 
     # ---- isolation ----------------------------------------------------------
+    def guarded_paths(self) -> list[Path]:
+        return [self.root / "receipts", self.root / "inputs", self.root / "manifests", self.log_path, self.checks]
+
+    def engine_config(self, engine: str) -> dict:
+        cfg = self.config.get("engines", {}).get(engine)
+        if not cfg:
+            raise Blocked(f"engine {engine!r} is not configured")
+        return cfg
+
     def require_isolation(self, manifest: dict) -> None:
+        """Refuse anything the Seatbelt wrapper cannot confine: wrong binary, escape flags, overlapping paths."""
         if self.config.get("allow_full_access"):
             raise Blocked("ringer config allows full access; enforced isolation cannot be claimed")
         workdir = Path(manifest["workdir"]).resolve()
-        engines = self.config.get("engines", {})
         for t in manifest["tasks"]:
             engine = t.get("engine") or "codex"
-            bin_name = Path(str(engines.get(engine, {}).get("bin", engine))).name
-            if bin_name not in SANDBOXED_BINS:
-                raise Blocked(f"task {t['key']}: engine {engine!r} has no verified write sandbox; refusing to gate it")
+            cfg = self.engine_config(engine)
+            bin_path = Path(str(cfg.get("bin", "")))
+            if (not bin_path.is_file() or bin_path.is_symlink()
+                    or file_sha(bin_path) != file_sha(TRUSTED_WRAPPER)):
+                raise Blocked(f"task {t['key']}: engine {engine!r} bin is not the trusted Seatbelt wrapper; refusing to gate it")
+            if bin_path.stat().st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                raise Blocked(f"engine {engine!r} wrapper is group/world writable")
+            args = [str(a) for a in cfg.get("args_template", [])]
+            if args[:2] != ["{taskdir}", "{access_args}"]:
+                raise Blocked(f"engine {engine!r} args_template must start with {{taskdir}}, {{access_args}}")
+            extra = args + [str(a) for a in cfg.get("sandbox_args", [])] + [str(a) for a in t.get("engine_args", [])]
+            if ESCAPE_FLAGS & set(extra):
+                raise Blocked(f"task {t['key']}: sandbox escape flag in engine/task arguments")
             if t.get("full_access"):
                 raise Blocked(f"task {t['key']} requests full_access; refusing to gate it")
             taskdir = workdir / t["key"]
-            for guarded in (self.root / "receipts", self.root / "inputs", self.root / "manifests",
-                            self.log_path, self.checks):
-                if inside(guarded, taskdir):
-                    raise Blocked(f"gate path {guarded} lies inside writable task dir {taskdir}")
+            for guarded in self.guarded_paths():
+                for root in [taskdir, *WRAPPER_WRITE_ROOTS]:
+                    if inside(guarded, root):
+                        raise Blocked(f"gate path {guarded} lies inside sandbox-writable {root}")
+
+    def verify_invocations(self, name: str, tasks: dict) -> list[str]:
+        """Check the command Ringer actually ran: trusted wrapper, own task dir first, no escape flag."""
+        problems = []
+        for k, t in tasks.items():
+            log = Path(t.get("log_path") or "")
+            cmds = [l.split("command:", 1)[1].strip() for l in (log.read_text(errors="replace").splitlines() if log.is_file() else [])
+                    if l.startswith("[ringer.py] command:")]
+            if not cmds:
+                problems.append(f"{k}: no recorded worker command")
+            for c in cmds:
+                argv = shlex.split(c.replace("< /dev/null", ""))
+                if len(argv) < 2 or Path(argv[0]).resolve() != Path(str(self.engine_config(t.get("engine") or "codex")["bin"])).resolve():
+                    problems.append(f"{k}: worker not launched through the trusted wrapper")
+                elif Path(argv[1]).resolve() != Path(t["taskdir"]).resolve():
+                    problems.append(f"{k}: wrapper confined to {argv[1]}, not the task dir")
+                elif ESCAPE_FLAGS & set(argv[2:3]):
+                    problems.append(f"{k}: worker launched with a sandbox escape flag")
+        return problems
+
+    def binding(self, st: dict) -> dict:
+        """What a receipt must still match: stage definition, dependency set and runtime configuration."""
+        manifest = json.loads(self.manifest_path(st).read_text())
+        engines = sorted({t.get("engine") or "codex" for t in manifest["tasks"]})
+        runtime = {"allow_full_access": self.config.get("allow_full_access", False),
+                   "engines": {e: self.config.get("engines", {}).get(e) for e in engines},
+                   "wrapper_sha": file_sha(TRUSTED_WRAPPER), "gate_sha": file_sha(Path(__file__))}
+        return {"stage_def_sha": sha(json.dumps(st, sort_keys=True).encode()),
+                "needs_list": sorted(st.get("needs", [])),
+                "runtime_sha": sha(json.dumps(runtime, sort_keys=True, default=str).encode())}
 
     # ---- validation ---------------------------------------------------------
     def validate(self, name: str, seen: frozenset = frozenset()) -> dict:
@@ -198,6 +303,12 @@ class Gate:
             raise Blocked(f"stage {name} verdict {r.get('verdict')}")
         if r.get("manifest_sha") != file_sha(self.manifest_path(st)):
             raise Blocked(f"stage {name} manifest changed since its receipt")
+        now = self.binding(st)
+        for k, v in now.items():
+            if r.get("binding", {}).get(k) != v:
+                raise Blocked(f"stage {name} {k} changed since its receipt")
+        if sorted(r.get("needs", {})) != now["needs_list"]:
+            raise Blocked(f"stage {name} receipt dependencies differ from the current pipeline")
         run_copy = self.receipts / f"{name}.run.json"
         if not run_copy.exists() or file_sha(run_copy) != r.get("run_record_sha"):
             raise Blocked(f"run record for {name} missing or altered")
@@ -264,10 +375,10 @@ class Gate:
         try:
             out, _ = proc.communicate(timeout=limit)
         except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
+            alive = kill_tree(proc.pid)
             out, _ = proc.communicate()
             (logs / f"{name}.out").write_text(out or "")
-            raise Blocked(f"stage {name} exceeded controller timeout {limit}s")
+            raise Blocked(f"stage {name} exceeded controller timeout {limit}s; survivors after kill: {alive}")
         (logs / f"{name}.out").write_text(out or "")
         m = re.search(r"run_id:\s*(\S+)", out or "")
         if not m:
@@ -291,9 +402,18 @@ class Gate:
         if problems:
             verdict = "BLOCKED"
 
+        problems += self.verify_invocations(name, tasks)
+        if problems and verdict == "PASS":
+            verdict = "BLOCKED"
         artifacts, raw = {}, {}
         for k, t in tasks.items():
             taskdir = Path(t["taskdir"])
+            spec_t = manifest_task(manifest, k)
+            ctl = run_controller_check(spec_t["check"], taskdir, int(spec_t.get("check_timeout_s", 60)),
+                                       self.receipts / f"{name}.{k}.check.out") if taskdir.is_dir() else {"exit": "NO_TASKDIR"}
+            if ctl["exit"] != 0 and verdict == "PASS":
+                verdict = "FAIL"
+                problems.append(f"{k}: controller re-run of the check exited {ctl['exit']}")
             missing = [f for f in manifest_task(manifest, k).get("expect_files", []) if not (taskdir / f).is_file()]
             if missing:
                 verdict = "FAIL" if verdict == "PASS" else verdict
@@ -303,12 +423,12 @@ class Gate:
             log_copy = self.receipts / f"{name}.{k}.worker.log"
             if t.get("log_path") and Path(t["log_path"]).is_file():
                 shutil.copyfile(t["log_path"], log_copy)
-            raw[k] = {"worker_log_copy": str(log_copy), "check_returncode": t.get("check_returncode"),
-                      "check_output": t.get("check_output_tail")}
+            raw[k] = {"worker_log_copy": str(log_copy), "ringer_check_returncode": t.get("check_returncode"),
+                      "controller_check": ctl}
         receipt = {
             "pipeline": self.p.get("name"), "stage": name, "run_id": run["run_id"], "verdict": verdict,
             "verdicts": verdicts, "problems": problems, "ringer_exit": proc.returncode,
-            "manifest_sha": file_sha(mpath), "rendered_manifest_sha": file_sha(rendered),
+            "manifest_sha": file_sha(mpath), "rendered_manifest_sha": file_sha(rendered), "binding": self.binding(st),
             "run_record_sha": file_sha(run_copy), "checks_digest": checks_before,
             "inputs_digest": inputs_before,
             "needs": {n: file_sha(self.receipt_path(n)) for n in needs},

@@ -7,13 +7,22 @@ Pinned here (no workers spawn; receipts and run records are fabricated):
   * --resume never skips a stage on receipt existence alone: FAIL, stale,
     changed-manifest and changed-check receipts are re-run, not certified
   * a missing checks_dir is an error, not an empty digest
+  * the engine bin must be byte-identical to the repo's Seatbelt wrapper, with
+    no escape flag in its arguments, and gate state outside its writable roots
+  * the command Ringer actually logged must launch the wrapper on the task dir
+  * receipts bind the current dependency set and runtime configuration
+  * a timeout kills Ringer's detached worker sessions, not just its own group
+  * the controller re-runs each check and keeps its complete raw output
 """
 from __future__ import annotations
 
 import importlib.util
 import json
 import os
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -22,7 +31,9 @@ spec = importlib.util.spec_from_file_location("ringer_gate", ROOT / "scripts" / 
 gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)
 
-SANDBOX_CONFIG = 'allow_full_access = false\n[engines.opencode]\nbin = "/x/engines/opencode-sandboxed.sh"\n'
+SANDBOX_CONFIG = (f'allow_full_access = false\n[engines.opencode]\nbin = "{gate.TRUSTED_WRAPPER}"\n'
+                  'args_template = ["{taskdir}", "{access_args}", "run", "--dir", "{taskdir}", "{spec}"]\n'
+                  'sandbox_args = []\nfull_access_args = ["--no-sandbox"]\n')
 
 
 class GateFixture(unittest.TestCase):
@@ -61,7 +72,7 @@ class GateFixture(unittest.TestCase):
         run_copy.write_text(json.dumps(run))
         receipt = {"pipeline": "t", "stage": "s1", "run_id": "r1", "verdict": verdict,
                    "manifest_sha": gate.file_sha(self.base / "s1.json"), "run_record_sha": gate.file_sha(run_copy),
-                   "checks_digest": g.checks_digest(), "needs": {},
+                   "checks_digest": g.checks_digest(), "needs": {}, "binding": g.binding(g.stages["s1"]),
                    "artifacts": {"gen": {"taskdir": str(taskdir), "digest": gate.tree_digest(taskdir)[0]}}}
         g.receipt_path("s1").write_text(json.dumps(receipt))
         return taskdir
@@ -94,7 +105,7 @@ class IsolationTests(GateFixture):
 
     def test_unsandboxed_engine_is_refused(self) -> None:
         g = gate.Gate(self.pipeline)
-        with self.assertRaisesRegex(gate.Blocked, "no verified write sandbox"):
+        with self.assertRaisesRegex(gate.Blocked, "not configured|not the trusted Seatbelt wrapper"):
             g.require_isolation(self.manifest(engine="codex"))
 
     def test_full_access_task_is_refused(self) -> None:
@@ -107,7 +118,7 @@ class IsolationTests(GateFixture):
         m = self.manifest()
         m["workdir"] = str(self.root.parent)
         m["tasks"][0]["key"] = "root"
-        with self.assertRaisesRegex(gate.Blocked, "inside writable task dir"):
+        with self.assertRaisesRegex(gate.Blocked, "sandbox-writable"):
             g.require_isolation(m)
 
     def test_sandboxed_engine_passes(self) -> None:
@@ -155,6 +166,109 @@ class ResumeTests(GateFixture):
         (g.receipts / "s1.run.json").write_text('{"run_id":"r1","tasks":[]}')
         code, calls = self.resume_with_fake_run(g, "FAIL")
         self.assertEqual((code, calls), (2, ["s1"]))
+
+
+class WrapperBindingTests(GateFixture):
+    def manifest(self, **task) -> dict:
+        t = {"key": "gen", "engine": "opencode", "check": "true", **task}
+        return {"workdir": str(self.root / "work" / "s1"), "tasks": [t]}
+
+    def reconfigure(self, text: str) -> gate.Gate:
+        Path(os.environ["RINGER_CONFIG"]).write_text(text)
+        return gate.Gate(self.pipeline)
+
+    def test_lookalike_wrapper_is_refused(self) -> None:
+        fake = self.base / "engines" / "opencode-sandboxed.sh"
+        fake.parent.mkdir()
+        fake.write_text("#!/bin/sh\nshift; exec opencode \"$@\"\n")
+        g = self.reconfigure(SANDBOX_CONFIG.replace(str(gate.TRUSTED_WRAPPER), str(fake)))
+        with self.assertRaisesRegex(gate.Blocked, "not the trusted Seatbelt wrapper"):
+            g.require_isolation(self.manifest())
+
+    def test_escape_flag_in_args_template_is_refused(self) -> None:
+        g = self.reconfigure(SANDBOX_CONFIG.replace('"run",', '"--no-sandbox", "run",'))
+        with self.assertRaisesRegex(gate.Blocked, "escape flag"):
+            g.require_isolation(self.manifest())
+
+    def test_escape_flag_in_task_engine_args_is_refused(self) -> None:
+        with self.assertRaisesRegex(gate.Blocked, "escape flag"):
+            gate.Gate(self.pipeline).require_isolation(self.manifest(engine_args=["--no-sandbox"]))
+
+    def test_gate_state_inside_wrapper_write_root_is_refused(self) -> None:
+        old = gate.WRAPPER_WRITE_ROOTS
+        gate.WRAPPER_WRITE_ROOTS = [self.base]
+        try:
+            with self.assertRaisesRegex(gate.Blocked, "sandbox-writable"):
+                gate.Gate(self.pipeline).require_isolation(self.manifest())
+        finally:
+            gate.WRAPPER_WRITE_ROOTS = old
+
+    def write_log(self, command: str) -> dict:
+        taskdir = self.root / "work" / "s1" / "gen"
+        taskdir.mkdir(parents=True, exist_ok=True)
+        log = taskdir / "worker.log"
+        log.write_text(f"[ringer.py] engine: opencode\n[ringer.py] command: {command} < /dev/null\n")
+        return {"gen": {"engine": "opencode", "taskdir": str(taskdir), "log_path": str(log)}}
+
+    def test_logged_invocation_is_verified(self) -> None:
+        g = gate.Gate(self.pipeline)
+        td = self.root / "work" / "s1" / "gen"
+        ok = self.write_log(f"{gate.TRUSTED_WRAPPER} {td} run --dir {td} spec")
+        self.assertEqual(g.verify_invocations("s1", ok), [])
+        esc = self.write_log(f"{gate.TRUSTED_WRAPPER} {td} --no-sandbox run spec")
+        self.assertTrue(any("escape" in p for p in g.verify_invocations("s1", esc)))
+        other = self.write_log(f"{gate.TRUSTED_WRAPPER} {self.base} run spec")
+        self.assertTrue(any("not the task dir" in p for p in g.verify_invocations("s1", other)))
+        wrong = self.write_log(f"/usr/bin/env {td} run spec")
+        self.assertTrue(any("trusted wrapper" in p for p in g.verify_invocations("s1", wrong)))
+
+
+class BindingTests(GateFixture):
+    def test_changed_dependency_set_is_rerun(self) -> None:
+        g = gate.Gate(self.pipeline)
+        self.write_receipt(g)
+        p = json.loads(self.pipeline.read_text())
+        p["stages"].insert(0, {"name": "s0", "manifest": "s1.json", "needs": []})
+        p["stages"][1]["needs"] = ["s0"]
+        self.pipeline.write_text(json.dumps(p))
+        with self.assertRaisesRegex(gate.Blocked, "changed since its receipt"):
+            gate.Gate(self.pipeline).validate("s1")
+
+    def test_changed_runtime_config_is_rerun(self) -> None:
+        g = gate.Gate(self.pipeline)
+        self.write_receipt(g)
+        Path(os.environ["RINGER_CONFIG"]).write_text(SANDBOX_CONFIG.replace('"run",', '"run", "--auto",'))
+        with self.assertRaisesRegex(gate.Blocked, "runtime_sha changed"):
+            gate.Gate(self.pipeline).validate("s1")
+
+
+class KillTreeTests(unittest.TestCase):
+    def test_detached_grandchild_is_killed(self) -> None:
+        marker = f"{time.time_ns()}"
+        child = subprocess.Popen([sys.executable, "-c", (
+            "import subprocess,sys,time;"
+            f"subprocess.Popen(['sleep','7{marker[-5:]}'], start_new_session=True);"
+            "time.sleep(600)")])
+        time.sleep(1.0)
+        grandchildren = gate.descendants(child.pid)
+        self.assertTrue(grandchildren, "fixture should have spawned a detached sleeper")
+        self.assertEqual(gate.kill_tree(child.pid), [])
+        child.wait(timeout=5)
+        for p in grandchildren:
+            with self.assertRaises(ProcessLookupError):
+                os.kill(p, 0)
+
+
+class ControllerCheckTests(unittest.TestCase):
+    def test_full_raw_output_is_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "check.out"
+            r = gate.run_controller_check("python3 -c \"print('x'*5000)\"; echo err >&2; exit 3", Path(d), 30, out)
+            self.assertEqual(r["exit"], 3)
+            data = out.read_bytes()
+            self.assertIn(b"x" * 5000, data)
+            self.assertIn(b"err", data)
+            self.assertEqual(r["output_sha"], gate.sha(data))
 
 
 class ChecksDirTests(GateFixture):
