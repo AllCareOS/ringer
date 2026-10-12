@@ -52,6 +52,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from pathlib import Path
@@ -130,12 +131,21 @@ def render(obj, subs: dict[str, str]):
     return obj
 
 
+def proc_table() -> dict[int, tuple[int, str]]:
+    """pid -> (ppid, start time) for live, non-zombie processes."""
+    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,stat=,lstart="], capture_output=True, text=True).stdout
+    table = {}
+    for line in out.splitlines():
+        pid, ppid, st, start = line.split(None, 3)
+        if not st.startswith("Z"):
+            table[int(pid)] = (int(ppid), start.strip())
+    return table
+
+
 def descendants(pid: int) -> list[int]:
     """All live descendants of pid (Ringer starts workers in their own sessions, so groups are not enough)."""
-    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True).stdout
     children: dict[int, list[int]] = {}
-    for line in out.splitlines():
-        c, pp = (int(x) for x in line.split())
+    for c, (pp, _) in proc_table().items():
         children.setdefault(pp, []).append(c)
     found, stack = [], [pid]
     while stack:
@@ -145,11 +155,24 @@ def descendants(pid: int) -> list[int]:
     return found
 
 
-def kill_tree(pid: int) -> list[int]:
-    """Freeze then kill pid and every descendant; return any pid still alive afterwards."""
+def cwd_inside(root: Path) -> list[int]:
+    """Processes whose working directory is inside root (catches daemons that escaped the parent tree)."""
+    out = subprocess.run(["lsof", "-a", "-d", "cwd", "-Fpn"], capture_output=True, text=True).stdout
+    found, pid = [], None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("n") and pid and pid != os.getpid() and inside(Path(line[1:]), root):
+            found.append(pid)
+    return found
+
+
+def kill_tree(pid: int, extra: list[int] = (), sweep: Path | None = None) -> list[int]:
+    """Freeze then kill pid, its descendants, previously seen pids and processes working inside sweep."""
     victims: list[int] = []
     for _ in range(5):
-        tree = [pid, *descendants(pid)] if pid else []
+        tree = ([pid, *descendants(pid)] if pid else []) + list(extra) + (cwd_inside(sweep) if sweep else [])
+        tree += [d for p in list(tree) for d in descendants(p)]
         new = [p for p in tree if p not in victims]
         for p in new:
             try:
@@ -165,9 +188,14 @@ def kill_tree(pid: int) -> list[int]:
         except ProcessLookupError:
             pass
     time.sleep(0.5)
-    states = subprocess.run(["ps", "-A", "-o", "pid=,stat="], capture_output=True, text=True).stdout
-    live = {int(pid) for pid, st in (l.split()[:2] for l in states.splitlines()) if not st.startswith("Z")}
-    return [p for p in victims if p in live]  # zombies are dead, merely unreaped
+    live = proc_table()
+    return [p for p in victims if p in live]
+
+
+def still_same(seen: dict[int, str]) -> list[int]:
+    """Seen pids still alive with the same start time (guards against pid reuse)."""
+    now = proc_table()
+    return [p for p, start in seen.items() if p in now and now[p][1] == start]
 
 
 def run_controller_check(command: str, cwd: Path, timeout: int, out_path: Path) -> dict:
@@ -372,14 +400,27 @@ class Gate:
                "--no-dashboard", "--no-artifact"]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                 env={**os.environ, "RINGER_NO_SELF_UPDATE": "1"}, start_new_session=True)
-        try:
-            out, _ = proc.communicate(timeout=limit)
-        except subprocess.TimeoutExpired:
-            alive = kill_tree(proc.pid)
-            out, _ = proc.communicate()
-            (logs / f"{name}.out").write_text(out or "")
+        out_path = logs / f"{name}.out"
+        seen: dict[int, str] = {}
+        workdir = Path(manifest["workdir"]).resolve()
+        deadline = time.monotonic() + limit
+        reader = threading.Thread(target=lambda: out_path.write_text(proc.stdout.read() or ""))
+        reader.start()
+        while proc.poll() is None and time.monotonic() < deadline:
+            table = proc_table()  # remember workers (pid + start time) before they can be reparented
+            seen.update({p: table[p][1] for p in descendants(proc.pid) if p in table})
+            time.sleep(0.25)
+        if proc.poll() is None:
+            alive = kill_tree(proc.pid, still_same(seen), workdir)
+            reader.join(10)
             raise Blocked(f"stage {name} exceeded controller timeout {limit}s; survivors after kill: {alive}")
-        (logs / f"{name}.out").write_text(out or "")
+        reader.join()
+        out = out_path.read_text()
+        leftovers = still_same(seen) + cwd_inside(workdir)
+        if leftovers:
+            survivors = kill_tree(0, leftovers, workdir)
+            raise Blocked(f"stage {name} left background processes {sorted(set(leftovers))} after Ringer exited; "
+                          f"killed, survivors: {survivors}")
         m = re.search(r"run_id:\s*(\S+)", out or "")
         if not m:
             raise Blocked(f"ringer exited {proc.returncode} without a run_id")

@@ -259,6 +259,18 @@ class KillTreeTests(unittest.TestCase):
                 os.kill(p, 0)
 
 
+    def test_reparented_daemon_in_task_dir_is_swept(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run([sys.executable, "-c",
+                            "import subprocess; subprocess.Popen(['sleep','7397'], start_new_session=True)"],
+                           cwd=d, check=True)
+            time.sleep(0.5)
+            orphans = gate.cwd_inside(Path(d))
+            self.assertTrue(orphans, "fixture daemon should be found by its working directory")
+            self.assertEqual(gate.kill_tree(0, [], Path(d)), [])
+            self.assertEqual(gate.cwd_inside(Path(d)), [])
+
+
 class ControllerCheckTests(unittest.TestCase):
     def test_full_raw_output_is_kept(self) -> None:
         with tempfile.TemporaryDirectory() as d:
