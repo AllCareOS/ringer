@@ -1,0 +1,20 @@
+{
+ "run_name": "gate-demo-s1_missing",
+ "workdir": "{inputs}/../../work/s1",
+ "max_parallel": 1,
+ "tasks": [
+  {
+   "key": "gen",
+   "engine": "opencode",
+   "task_type": "probe",
+   "timeout_s": 240,
+   "max_attempts": 1,
+   "spec": "Create numbers.txt in the current directory containing the integers 1 to 5, one per line, nothing else.",
+   "check": "sh {checks}/s1_numbers.sh",
+   "expect_files": [
+    "numbers.txt",
+    "summary.txt"
+   ]
+  }
+ ]
+}
