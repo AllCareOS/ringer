@@ -1,6 +1,6 @@
 {
  "run_name": "gate-demo-s3",
- "workdir": "{inputs}/../../work/s3",
+ "workdir": "{root}/work/s3",
  "max_parallel": 1,
  "tasks": [
   {

@@ -1,3 +1,10 @@
 # Stage gate demo
 
-`run_demo.sh [BASE_DIR]` runs a 3-stage OpenCode pipeline (numbers -> sum -> report) through `scripts/ringer_gate.py`, then five cases that must stop before stage s2 launches: failing check, worker timeout, missing expected file, check script edited after s1 passed, and s1 artifact edited after its receipt (stale receipt). Each line ends `OK` when the gate behaved as required. Requires the `opencode` engine in `~/.config/ringer/config.toml`.
+`run_demo.sh [BASE_DIR]` drives `scripts/ringer_gate.py` with real Ringer runs (Python 3.11+, the sandboxed `opencode` engine in `~/.config/ringer/config.toml`). Every line must end `OK`:
+
+- `happy`: numbers -> sum -> report certifies (`pipeline_pass`).
+- `failcheck`, `timeout`, `missing`, `symlink`, `codex`: stage s2 never launches (failing check, worker timeout, missing expected file, symlinked artifact, engine without a verified write sandbox).
+- `failresume`, `editedcheck`, `stale`: on `--resume` the invalid s1 receipt (FAIL, check edited after PASS, artifact edited after PASS) is re-run, never skipped.
+- `mutate`: a deterministic hostile worker (`hostile/opencode`, run through the real Seatbelt wrapper) tries to chmod and write its input snapshot, the check scripts, the receipts and the gate log. Every attempt must be denied and the pipeline still certifies on unchanged inputs.
+
+Input snapshots are left read-only; run `chmod -R u+w BASE_DIR` before deleting a demo directory.

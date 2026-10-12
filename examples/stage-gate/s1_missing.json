@@ -1,6 +1,6 @@
 {
  "run_name": "gate-demo-s1_missing",
- "workdir": "{inputs}/../../work/s1",
+ "workdir": "{root}/work/s1",
  "max_parallel": 1,
  "tasks": [
   {

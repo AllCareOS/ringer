@@ -5,30 +5,37 @@ Ringer runs every task in a manifest concurrently and has no dependency field,
 so a PASS in one task cannot hold back another. This wrapper turns a sequence of
 Ringer manifests into gated stages:
 
-* each stage is its own `ringer.py run`;
-* a stage starts only if every stage it `needs` has a receipt whose run record
-  is all-PASS, whose artifacts still hash to the recorded digest (stale-receipt
-  rejection, including untracked files) and whose check files are unchanged;
-* validated artifacts are copied into a read-only snapshot under the consuming
-  stage's inputs dir, and the snapshot digest is re-verified, so nothing can
-  change between validation and consumption;
-* check files live outside every worker-writable task dir, are made read-only
-  during the run, and are hashed before and after it;
-* any FAIL, TIMEOUT, missing artifact, missing check, missing receipt or digest
+* each stage is its own `ringer.py run`, under a controller timeout;
+* a stage starts only if every stage it `needs` has a receipt that re-validates
+  now: bound to that stage's name and manifest, its run record (copied into the
+  receipt dir) is all-PASS for exactly the manifest's task keys, its artifacts
+  still hash to the recorded digest (all files, tracked or not), its check files
+  are unchanged, and the receipts it consumed are still the ones it recorded;
+* `--resume` skips a stage only when its receipt passes that same validation;
+  a failed, stale or re-defined stage is re-run, never skipped on existence;
+* validated artifacts are copied into a snapshot under the consuming stage's
+  inputs dir, re-verified against the receipt, and compared again after the run;
+* isolation is enforced by the worker sandbox, not by file modes: every task
+  must use an engine whose OS sandbox confines writes to its own task dir (the
+  Seatbelt `opencode-sandboxed.sh` wrapper), no task may request full access,
+  and gate state, checks and snapshots must lie outside every task dir.
+  Unsupported engines are refused rather than run "unenforced";
+* symlinks and special files in artifacts or checks are rejected;
+* any FAIL, TIMEOUT, missing artifact, unchecked task, missing receipt or digest
   mismatch is BLOCKED, and later stages are recorded as not_started.
 
 Pipeline file (JSON):
 {
   "name": "demo",
-  "root": "/tmp/demo",                 # receipts, rendered manifests, inputs
-  "checks_dir": "/tmp/demo-checks",    # protected check scripts
+  "root": "/tmp/demo",                 # receipts, rendered manifests, inputs, work
+  "checks_dir": "/tmp/demo-checks",    # check scripts (must exist)
   "stages": [
     {"name": "s1", "manifest": "s1.json", "needs": []},
-    {"name": "s2", "manifest": "s2.json", "needs": ["s1"]}
+    {"name": "s2", "manifest": "s2.json", "needs": ["s1"], "timeout_s": 900}
   ]
 }
-Manifest strings may use {inputs} (this stage's read-only input snapshot dir)
-and {checks} (checks_dir). Usage:
+Manifest strings may use {inputs} (this stage's snapshot dir), {checks}
+(checks_dir) and {root}. Usage:
 
   ringer_gate.py PIPELINE [--stop-after STAGE] [--resume]
 """
@@ -40,38 +47,70 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import time
+import tomllib
 from pathlib import Path
 
 RINGER = Path(__file__).resolve().parent.parent / "ringer.py"
-RUNS_DIR = Path(os.environ.get("RINGER_STATE_DIR", "~/.ringer")).expanduser() / "runs"
 EXCLUDE = {"worker.log"}
+SANDBOXED_BINS = {"opencode-sandboxed.sh"}  # engines whose OS sandbox confines writes to the task dir
 
 
 class Blocked(Exception):
     pass
 
 
+def runs_dir() -> Path:
+    return Path(os.environ.get("RINGER_STATE_DIR", "~/.ringer")).expanduser() / "runs"
+
+
+def ringer_config() -> dict:
+    p = Path(os.environ.get("RINGER_CONFIG", "~/.config/ringer/config.toml")).expanduser()
+    return tomllib.loads(p.read_text()) if p.exists() else {}
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def file_sha(p: Path) -> str:
+    return sha(p.read_bytes())
+
+
 def tree_digest(root: Path, exclude: set[str] = EXCLUDE) -> tuple[str, dict[str, str]]:
-    """sha256 over every regular file (tracked or not) below root."""
+    """sha256 over every regular file below root; symlinks and special files are refused."""
+    if not root.is_dir() or root.is_symlink():
+        raise Blocked(f"{root} is not a real directory")
     files: dict[str, str] = {}
-    for p in sorted(root.rglob("*")):
-        if p.is_file() and not p.is_symlink() and p.name not in exclude:
-            files[str(p.relative_to(root))] = hashlib.sha256(p.read_bytes()).hexdigest()
-    h = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
-    return h, files
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for name in dirnames + filenames:
+            p = Path(dirpath) / name
+            st = p.lstat()
+            if stat.S_ISLNK(st.st_mode):
+                raise Blocked(f"symlink not allowed in gated tree: {p}")
+            if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
+                raise Blocked(f"special file not allowed in gated tree: {p}")
+        for name in filenames:
+            if name in exclude:
+                continue
+            p = Path(dirpath) / name
+            files[str(p.relative_to(root))] = file_sha(p)
+    return sha(json.dumps(files, sort_keys=True).encode()), files
 
 
-def set_writable(root: Path, writable: bool) -> None:
+def set_readonly(root: Path) -> None:
+    """Defence in depth only; the sandbox is what prevents writes."""
     for p in [root, *root.rglob("*")]:
-        mode = p.stat().st_mode
-        if writable:
-            p.chmod(mode | stat.S_IWUSR)
-        else:
-            p.chmod(mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+        p.chmod(p.lstat().st_mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+
+
+def make_writable(root: Path) -> None:
+    for p in [root, *root.rglob("*")]:
+        p.chmod(p.lstat().st_mode | stat.S_IWUSR)
 
 
 def render(obj, subs: dict[str, str]):
@@ -86,15 +125,27 @@ def render(obj, subs: dict[str, str]):
     return obj
 
 
+def inside(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
 class Gate:
     def __init__(self, pipeline_path: Path):
         self.pipeline_path = pipeline_path.resolve()
         self.p = json.loads(self.pipeline_path.read_text())
         self.root = Path(self.p["root"]).resolve()
         self.checks = Path(self.p["checks_dir"]).resolve()
+        if not self.checks.is_dir():
+            raise SystemExit(f"checks_dir {self.checks} does not exist")
         self.receipts = self.root / "receipts"
         self.log_path = self.root / "gate-log.jsonl"
         self.receipts.mkdir(parents=True, exist_ok=True)
+        self.stages = {s["name"]: s for s in self.p["stages"]}
+        self.config = ringer_config()
 
     def log(self, **event) -> None:
         event["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -105,122 +156,215 @@ class Gate:
     def receipt_path(self, stage: str) -> Path:
         return self.receipts / f"{stage}.json"
 
-    # ---- validation -------------------------------------------------------
-    def validate(self, need: str) -> dict:
-        rp = self.receipt_path(need)
+    def manifest_path(self, st: dict) -> Path:
+        return (self.pipeline_path.parent / st["manifest"]).resolve()
+
+    def checks_digest(self) -> str:
+        return tree_digest(self.checks, exclude=set())[0]
+
+    # ---- isolation ----------------------------------------------------------
+    def require_isolation(self, manifest: dict) -> None:
+        if self.config.get("allow_full_access"):
+            raise Blocked("ringer config allows full access; enforced isolation cannot be claimed")
+        workdir = Path(manifest["workdir"]).resolve()
+        engines = self.config.get("engines", {})
+        for t in manifest["tasks"]:
+            engine = t.get("engine") or "codex"
+            bin_name = Path(str(engines.get(engine, {}).get("bin", engine))).name
+            if bin_name not in SANDBOXED_BINS:
+                raise Blocked(f"task {t['key']}: engine {engine!r} has no verified write sandbox; refusing to gate it")
+            if t.get("full_access"):
+                raise Blocked(f"task {t['key']} requests full_access; refusing to gate it")
+            taskdir = workdir / t["key"]
+            for guarded in (self.root / "receipts", self.root / "inputs", self.root / "manifests",
+                            self.log_path, self.checks):
+                if inside(guarded, taskdir):
+                    raise Blocked(f"gate path {guarded} lies inside writable task dir {taskdir}")
+
+    # ---- validation ---------------------------------------------------------
+    def validate(self, name: str, seen: frozenset = frozenset()) -> dict:
+        if name in seen:
+            raise Blocked(f"dependency cycle at {name}")
+        st = self.stages.get(name)
+        if st is None:
+            raise Blocked(f"unknown stage {name}")
+        rp = self.receipt_path(name)
         if not rp.exists():
-            raise Blocked(f"no receipt for required stage {need}")
+            raise Blocked(f"no receipt for stage {name}")
         r = json.loads(rp.read_text())
+        if r.get("stage") != name or r.get("pipeline") != self.p.get("name"):
+            raise Blocked(f"receipt {rp.name} is bound to another stage or pipeline")
         if r.get("verdict") != "PASS":
-            raise Blocked(f"required stage {need} verdict {r.get('verdict')}")
-        run_file = RUNS_DIR / f"{r['run_id']}.json"
-        if not run_file.exists():
-            raise Blocked(f"run record {r['run_id']} missing")
-        run = json.loads(run_file.read_text())
+            raise Blocked(f"stage {name} verdict {r.get('verdict')}")
+        if r.get("manifest_sha") != file_sha(self.manifest_path(st)):
+            raise Blocked(f"stage {name} manifest changed since its receipt")
+        run_copy = self.receipts / f"{name}.run.json"
+        if not run_copy.exists() or file_sha(run_copy) != r.get("run_record_sha"):
+            raise Blocked(f"run record for {name} missing or altered")
+        run = json.loads(run_copy.read_text())
+        expected = sorted(t["key"] for t in json.loads(self.manifest_path(st).read_text())["tasks"])
+        got = sorted(t["key"] for t in run["tasks"])
+        if got != expected or sorted(r["artifacts"]) != expected:
+            raise Blocked(f"stage {name} receipt covers {got}, manifest expects {expected}")
         bad = [t["key"] for t in run["tasks"] if t.get("verdict") != "PASS"]
-        if bad or not run["tasks"]:
-            raise Blocked(f"run record {r['run_id']} not all PASS: {bad}")
+        if bad:
+            raise Blocked(f"run record for {name} not all PASS: {bad}")
         for key, rec in r["artifacts"].items():
-            digest, _ = tree_digest(Path(rec["taskdir"]))
-            if digest != rec["digest"]:
-                raise Blocked(f"stale receipt: {need}/{key} artifacts changed since PASS")
-        checks_now, _ = tree_digest(self.checks, exclude=set())
-        if checks_now != r["checks_digest"]:
-            raise Blocked(f"check files changed since {need} passed")
+            if tree_digest(Path(rec["taskdir"]))[0] != rec["digest"]:
+                raise Blocked(f"stale receipt: {name}/{key} artifacts changed since PASS")
+        if self.checks_digest() != r["checks_digest"]:
+            raise Blocked(f"check files changed since {name} passed")
+        for need, need_sha in r.get("needs", {}).items():
+            self.validate(need, seen | {name})
+            if file_sha(self.receipt_path(need)) != need_sha:
+                raise Blocked(f"{name} consumed a different {need} receipt than the current one")
         return r
 
     def snapshot(self, stage: str, needs: dict[str, dict]) -> Path:
         inputs = self.root / "inputs" / stage
         if inputs.exists():
-            set_writable(inputs, True)
+            make_writable(inputs)
             shutil.rmtree(inputs)
+        inputs.mkdir(parents=True)
         for need, r in needs.items():
             for key, rec in r["artifacts"].items():
                 dst = inputs / need / key
-                shutil.copytree(rec["taskdir"], dst, ignore=shutil.ignore_patterns(*EXCLUDE))
+                shutil.copytree(rec["taskdir"], dst, symlinks=True, ignore=shutil.ignore_patterns(*EXCLUDE))
                 if tree_digest(dst)[0] != rec["digest"]:
                     raise Blocked(f"snapshot of {need}/{key} does not match its receipt")
-        inputs.mkdir(parents=True, exist_ok=True)
-        set_writable(inputs, False)
+        set_readonly(inputs)
         return inputs
 
-    # ---- execution --------------------------------------------------------
-    def run_stage(self, st: dict, inputs: Path) -> dict:
-        manifest = json.loads((self.pipeline_path.parent / st["manifest"]).read_text())
-        manifest = render(manifest, {"inputs": str(inputs), "checks": str(self.checks)})
+    # ---- execution ----------------------------------------------------------
+    def run_stage(self, st: dict, needs: dict[str, dict]) -> dict:
+        name = st["name"]
+        mpath = self.manifest_path(st)
+        inputs = self.snapshot(name, needs)
+        manifest = render(json.loads(mpath.read_text()),
+                          {"inputs": str(inputs), "checks": str(self.checks), "root": str(self.root)})
         for t in manifest["tasks"]:
             if not str(t.get("check", "")).strip():
                 raise Blocked(f"task {t.get('key')} has no check; unchecked work cannot pass the gate")
-        rendered = self.root / "manifests" / f"{st['name']}.json"
+        self.require_isolation(manifest)
+        rendered = self.root / "manifests" / f"{name}.json"
         rendered.parent.mkdir(parents=True, exist_ok=True)
         rendered.write_text(json.dumps(manifest, indent=1))
 
-        checks_before, _ = tree_digest(self.checks, exclude=set())
-        set_writable(self.checks, False)
+        checks_before = self.checks_digest()
+        inputs_before = tree_digest(inputs)[0]
+        limit = st.get("timeout_s") or 120 + sum(
+            (t.get("timeout_s", 900) + t.get("check_timeout_s", 60)) * t.get("max_attempts", 2)
+            for t in manifest["tasks"])
+        logs = self.root / "logs"
+        logs.mkdir(exist_ok=True)
+        cmd = [sys.executable, str(RINGER), "--no-self-update", "run", str(rendered),
+               "--no-dashboard", "--no-artifact"]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                env={**os.environ, "RINGER_NO_SELF_UPDATE": "1"}, start_new_session=True)
         try:
-            cmd = [str(RINGER), "--no-self-update", "run", str(rendered), "--no-dashboard", "--no-artifact"]
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  env={**os.environ, "RINGER_NO_SELF_UPDATE": "1"})
-        finally:
-            set_writable(self.checks, True)
-        (self.root / "logs").mkdir(exist_ok=True)
-        (self.root / "logs" / f"{st['name']}.out").write_text(proc.stdout + proc.stderr)
-        m = re.search(r"run_id:\s*(\S+)", proc.stdout)
+            out, _ = proc.communicate(timeout=limit)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            out, _ = proc.communicate()
+            (logs / f"{name}.out").write_text(out or "")
+            raise Blocked(f"stage {name} exceeded controller timeout {limit}s")
+        (logs / f"{name}.out").write_text(out or "")
+        m = re.search(r"run_id:\s*(\S+)", out or "")
         if not m:
             raise Blocked(f"ringer exited {proc.returncode} without a run_id")
-        run = json.loads((RUNS_DIR / f"{m.group(1)}.json").read_text())
-        checks_after, _ = tree_digest(self.checks, exclude=set())
+        run_file = runs_dir() / f"{m.group(1)}.json"
+        run_copy = self.receipts / f"{name}.run.json"
+        shutil.copyfile(run_file, run_copy)
+        run = json.loads(run_copy.read_text())
+
+        checks_after = self.checks_digest()
+        inputs_after = tree_digest(inputs)[0]
         tasks = {t["key"]: t for t in run["tasks"]}
         verdicts = {k: t.get("verdict") or t.get("status") for k, t in tasks.items()}
-        verdict = "PASS" if tasks and all(v == "PASS" for v in verdicts.values()) else "FAIL"
+        expected = sorted(t["key"] for t in manifest["tasks"])
+        verdict = "PASS" if sorted(tasks) == expected and all(v == "PASS" for v in verdicts.values()) else "FAIL"
+        problems = []
         if checks_after != checks_before:
+            problems.append("check files changed during run")
+        if inputs_after != inputs_before:
+            problems.append("input snapshot changed during run")
+        if problems:
             verdict = "BLOCKED"
+
+        artifacts, raw = {}, {}
+        for k, t in tasks.items():
+            taskdir = Path(t["taskdir"])
+            missing = [f for f in manifest_task(manifest, k).get("expect_files", []) if not (taskdir / f).is_file()]
+            if missing:
+                verdict = "FAIL" if verdict == "PASS" else verdict
+                problems.append(f"{k}: missing expected files {missing}")
+            digest, files = tree_digest(taskdir) if taskdir.is_dir() else ("", {})
+            artifacts[k] = {"taskdir": str(taskdir), "digest": digest, "files": files}
+            log_copy = self.receipts / f"{name}.{k}.worker.log"
+            if t.get("log_path") and Path(t["log_path"]).is_file():
+                shutil.copyfile(t["log_path"], log_copy)
+            raw[k] = {"worker_log_copy": str(log_copy), "check_returncode": t.get("check_returncode"),
+                      "check_output": t.get("check_output_tail")}
         receipt = {
-            "stage": st["name"], "run_id": run["run_id"], "verdict": verdict, "verdicts": verdicts,
-            "ringer_exit": proc.returncode, "checks_digest": checks_before,
-            "checks_changed_during_run": checks_after != checks_before,
-            "inputs_digest": tree_digest(inputs)[0],
-            "artifacts": {k: {"taskdir": t["taskdir"], "digest": tree_digest(Path(t["taskdir"]))[0],
-                              "files": tree_digest(Path(t["taskdir"]))[1]}
-                          for k, t in tasks.items() if Path(t["taskdir"]).exists()},
-            "check_output": {k: (t.get("check_output_tail") or "")[-400:] for k, t in tasks.items()},
+            "pipeline": self.p.get("name"), "stage": name, "run_id": run["run_id"], "verdict": verdict,
+            "verdicts": verdicts, "problems": problems, "ringer_exit": proc.returncode,
+            "manifest_sha": file_sha(mpath), "rendered_manifest_sha": file_sha(rendered),
+            "run_record_sha": file_sha(run_copy), "checks_digest": checks_before,
+            "inputs_digest": inputs_before,
+            "needs": {n: file_sha(self.receipt_path(n)) for n in needs},
+            "artifacts": artifacts, "raw": raw,
             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
-        self.receipt_path(st["name"]).write_text(json.dumps(receipt, indent=1))
+        self.receipt_path(name).write_text(json.dumps(receipt, indent=1))
         return receipt
 
     def run(self, stop_after: str | None, resume: bool) -> int:
-        stages = self.p["stages"]
-        for i, st in enumerate(stages):
+        order = self.p["stages"]
+        for i, st in enumerate(order):
             name = st["name"]
-            if resume and self.receipt_path(name).exists():
-                self.log(stage=name, event="skip_existing_receipt")
-                continue
             try:
+                if resume and self.receipt_path(name).exists():
+                    try:
+                        self.validate(name)
+                        self.log(stage=name, event="receipt_revalidated_skip")
+                        if stop_after == name:
+                            return 0
+                        continue
+                    except Blocked as e:
+                        self.log(stage=name, event="receipt_invalid_rerun", reason=str(e))
                 needs = {n: self.validate(n) for n in st.get("needs", [])}
-                inputs = self.snapshot(name, needs)
                 self.log(stage=name, event="launch", needs=list(needs))
-                r = self.run_stage(st, inputs)
+                r = self.run_stage(st, needs)
                 self.log(stage=name, event="result", verdict=r["verdict"], run_id=r["run_id"],
-                         verdicts=r["verdicts"])
+                         verdicts=r["verdicts"], problems=r["problems"])
                 if r["verdict"] != "PASS":
-                    raise Blocked(f"stage {name} verdict {r['verdict']} {r['verdicts']}")
+                    raise Blocked(f"stage {name} verdict {r['verdict']} {r['verdicts']} {r['problems']}")
             except Blocked as e:
                 self.log(stage=name, event="BLOCKED", reason=str(e),
-                         not_started=[s["name"] for s in stages[i + 1:]])
+                         not_started=[s["name"] for s in order[i + 1:]])
                 return 2
             if stop_after == name:
                 self.log(stage=name, event="stopped_after")
                 return 0
+        for st in order:  # final certification: every receipt must still validate
+            try:
+                self.validate(st["name"])
+            except Blocked as e:
+                self.log(event="BLOCKED", reason=f"final revalidation: {e}")
+                return 2
         self.log(event="pipeline_pass")
         return 0
+
+
+def manifest_task(manifest: dict, key: str) -> dict:
+    return next((t for t in manifest["tasks"] if t["key"] == key), {})
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("pipeline", type=Path)
     ap.add_argument("--stop-after", help="stop after this stage passes")
-    ap.add_argument("--resume", action="store_true", help="skip stages that already have receipts")
+    ap.add_argument("--resume", action="store_true", help="skip stages whose receipts still validate")
     a = ap.parse_args()
     return Gate(a.pipeline).run(a.stop_after, a.resume)
 
